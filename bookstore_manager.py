@@ -41,8 +41,6 @@ def connect_db() -> sqlite3.Connection:
             stotal INTEGER NOT NULL    -- 總額 = (書本單價 × 數量) - 折扣
         );
     ''')
-    conn.commit()
-    print("資料表建立完成或已存在。")
     return conn
 
 
@@ -82,8 +80,6 @@ def initialize_db(conn: sqlite3.Connection) -> None:
         """,
         sale
     )
-    conn.commit()
-    print("初始資料新增完成或已存在。")
 
 
 def add_sale(
@@ -96,39 +92,45 @@ def add_sale(
 ) -> tuple[bool, str]:
     """新增銷售記錄，驗證會員、書籍編號和庫存，計算總額並更新庫存。"""
     cursor = conn.cursor()
-    # 驗證會員是否存在
-    cursor.execute("SELECT mid FROM member WHERE mid = ?", (mid,))
-    member = cursor.fetchone()
-    if not member:
-        return False, f"錯誤：會員編號 {mid} 無效。"
+    try:
+        # 驗證會員是否存在
+        cursor.execute("SELECT mid FROM member WHERE mid = ?", (mid,))
+        member = cursor.fetchone()
+        if not member:
+            return False, f"錯誤：會員編號 {mid} 無效。"
 
-    # 驗證書籍是否存在且庫存足夠
-    cursor.execute("SELECT bprice, bstock FROM book WHERE bid = ?", (bid,))
-    book = cursor.fetchone()
-    if not book:
-        return False, f"錯誤：書籍編號 {bid} 無效。"
-    if book['bstock'] < sqty:
-        return False, f"錯誤：書籍庫存不足 (現有庫存: {book['bstock']})。"
+        # 驗證書籍是否存在且庫存足夠
+        cursor.execute("SELECT bprice, bstock FROM book WHERE bid = ?", (bid,))
+        book = cursor.fetchone()
+        if not book:
+            return False, f"錯誤：書籍編號 {bid} 無效。"
+        if book['bstock'] < sqty:
+            return False, f"錯誤：書籍庫存不足 (現有庫存: {book['bstock']})。"
 
-    # 計算總金額
-    stotal = (book['bprice'] * sqty) - sdiscount
+        # 計算總金額
+        stotal: int = (book['bprice'] * sqty) - sdiscount
 
-    # 新增銷售記錄
-    sql = """
-    INSERT INTO sale (sdate, mid, bid, sqty, sdiscount,stotal)
-    VALUES (?, ?, ?, ?, ?, ?)
-    """
-    cursor.execute(sql, (sdate, mid, bid, sqty, sdiscount, stotal))
-
-    # 更新書籍庫存
-    cursor.execute(
+        # 新增銷售記錄
+        insert: str = """
+        INSERT INTO sale (sdate, mid, bid, sqty, sdiscount, stotal)
+        VALUES (?, ?, ?, ?, ?, ?)
         """
-        UPDATE book SET bstock = bstock - ? WHERE bid = ?
-        """, (sqty, bid)
-    )
+        cursor.execute(insert, (sdate, mid, bid, sqty, sdiscount, stotal))
 
-    conn.commit()
-    return True, f"銷售記錄已新增！(銷售總額: {int(stotal):,})"
+        # 更新書籍庫存
+        sql_update_book: str = """
+        UPDATE book SET bstock = bstock - ? WHERE bid = ?
+        """
+        cursor.execute(sql_update_book, (sqty, bid))
+
+        # 提交交易
+        conn.commit()
+        return True, f"銷售記錄已新增！(銷售總額: {stotal:,})"
+
+    except sqlite3.Error as e:
+        # 回滾交易
+        conn.rollback()
+        return False, f"交易失敗：{e}"
 
 
 def print_sale_report(conn: sqlite3.Connection) -> None:
@@ -152,10 +154,10 @@ def print_sale_report(conn: sqlite3.Connection) -> None:
     sales = cursor.fetchall()
 
     if not sales:
-        print("\n目前沒有銷售記錄。")
+        print(f"\n目前沒有銷售記錄。")
         return
 
-    print("\n==================== 銷售報表 ====================")
+    print("f\n==================== 銷售報表 ====================")
     for sale in sales:
         print(f"銷售 #{sale['sid']}")
         print(f"銷售編號: {sale['sid']}")
@@ -165,7 +167,8 @@ def print_sale_report(conn: sqlite3.Connection) -> None:
         print("-" * 50)
         print(f"{'單價':<8}\t{'數量':<4}\t{'折扣':<6}\t{'小計'}")
         print("-" * 50)
-        print(f"{sale['bprice']:<8}\t{sale['sqty']:<4}\t{sale['sdiscount']:<6}\t{sale['stotal']:,}")
+        print(f"{sale['bprice']:<8}\t{sale['sqty']:<4}\t"
+              f"{sale['sdiscount']:<6}\t{sale['stotal']:,}")
         print("-" * 50)
         print(f"銷售總額: {sale['stotal']:,}")
         print("=" * 50)
@@ -175,19 +178,123 @@ def print_sale_report(conn: sqlite3.Connection) -> None:
 def update_sale(conn: sqlite3.Connection) -> None:
     """顯示銷售記錄列表，提示使用者輸入要更新的銷售編號和新的折扣金額，重新計算總額。"""
     cursor = conn.cursor()
-    return
+    cursor.execute("""
+        SELECT s.sid, m.mname, s.sdate
+        FROM sale s
+        JOIN member m ON s.mid = m.mid
+        ORDER BY s.sid
+    """)
+    sales_list = cursor.fetchall()
+
+    if not sales_list:
+        print(f"\n目前沒有銷售記錄可以更新。")
+        return
+
+    print(f"\n======== 銷售記錄列表 ========")
+    for sale in sales_list:
+        print(f"{sale['sid']}. 銷售編號: {sale['sid']} - 會員: {sale['mname']} - "
+              f"日期: {sale['sdate']}")
+    print(f"===============================")
+
+    while True:
+        saleid: str = input("請選擇要更新的銷售編號 (輸入數字或按 Enter 取消): ")
+        if not saleid:
+            print(f"取消更新。")
+            return
+        if saleid.isdigit():
+            sale_id: int = int(saleid)
+            cursor.execute("SELECT sid FROM sale WHERE sid = ?", (sale_id,))
+            existing_sale = cursor.fetchone()
+            if existing_sale:
+                break
+            else:
+                print(f"輸入的銷售編號不存在，請重新輸入。")
+        else:
+            print(f"輸入無效，請輸入數字或按 Enter 取消。")
+
+    while True:
+        ndiscount: str = input("請輸入新的折扣金額：")
+        if ndiscount.isdigit():
+            newdiscount: int = int(ndiscount)
+            if newdiscount >= 0:
+                break
+            else:
+                print(f"折扣金額不能為負數，請重新輸入。")
+        else:
+            print(f"輸入無效，請輸入數字。")
+
+    # 查詢相關的書籍單價和數量以重新計算總額
+    cursor.execute("""
+        SELECT b.bprice, s.sqty
+        FROM sale s
+        JOIN book b ON s.bid = b.bid
+        WHERE s.sid = ?
+    """, (sale_id,))
+    details = cursor.fetchone()
+
+    if details:
+        nstotal: int = (details['bprice'] * details['sqty']) - newdiscount
+        cursor.execute(
+            """
+            UPDATE sale SET sdiscount = ?, stotal = ? WHERE sid = ?
+            """,
+            (newdiscount, nstotal, sale_id)
+        )
+        conn.commit()
+        print(f"=> 銷售編號 {sale_id} 已更新！(銷售總額: {nstotal:,})")
+    else:
+        print(f"更新銷售記錄時發生錯誤，找不到相關銷售資訊。")
 
 
 def delete_sale(conn: sqlite3.Connection) -> None:
     """顯示銷售記錄列表，提示使用者輸入要刪除的銷售編號，執行刪除操作並提交"""
     cursor = conn.cursor()
-    return
+    cursor.execute(
+        """
+        SELECT s.sid, m.mname, s.sdate, b.btitle
+        FROM sale s
+        JOIN member m ON s.mid = m.mid
+        JOIN book b ON s.bid = b.bid
+        ORDER BY s.sid
+        """
+    )
+    sales_list = cursor.fetchall()
+
+    if not sales_list:
+        print(f"\n目前沒有銷售記錄可以刪除。")
+        return
+
+    print(f"\n======== 銷售記錄列表 ========")
+    for sale in sales_list:
+        print(f"{sale['sid']}. 銷售編號: {sale['sid']} - 會員: {sale['mname']} - "
+              f"書籍: {sale['btitle']} - 日期: {sale['sdate']}")
+    print(f"===============================")
+
+    while True:
+        sale_id_str: str = input(f"請選擇要刪除的銷售編號 (輸入數字或按 Enter 取消): ")
+        if not sale_id_str:
+            print(f"取消刪除。")
+            return
+        if sale_id_str.isdigit():
+            sale_id_to_delete: int = int(sale_id_str)
+            cursor.execute("SELECT sid FROM sale WHERE sid = ?",
+                           (sale_id_to_delete,))
+            existing_sale = cursor.fetchone()
+            if existing_sale:
+                break
+            else:
+                print(f"輸入的銷售編號不存在，請重新輸入。")
+        else:
+            print(f"=> 錯誤：請輸入有效的數字")
+
+    cursor.execute("DELETE FROM sale WHERE sid = ?", (sale_id_to_delete,))
+    conn.commit()
+    print(f"=> 銷售編號 {sale_id_to_delete} 已刪除")
 
 
 def main() -> None:
     """程式主流程，包含選單迴圈和各功能的呼叫"""
     with connect_db() as conn:
-        initialize_db(conn)
         cursor = conn.cursor()
         cursor.execute(f"SELECT COUNT(*) FROM member")
         member_count = cursor.fetchone()[0]
